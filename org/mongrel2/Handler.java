@@ -516,7 +516,7 @@ public final class Handler {
      *
      * @throws ZMQException if ZMQ has any problems disposing
      */
-    @Override public void close() throws IOException, ZMQException {
+    @Override public void close() throws IOException {
       reqs.close();
       resp.close();
       CTX.term();

@@ -120,7 +120,7 @@ Cons:
 
 But the main point is--you should be able to run handlers and spread their work however you like.
 
-Here's an example splitting work across ThreadPoolExecutor workers:
+####Example splitting work across ThreadPoolExecutor workers:
 
 ```java
 package org.mongrel2;
