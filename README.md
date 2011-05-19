@@ -2,12 +2,17 @@
 
 High performance Java Mongrel2 Handler that fully supports all of the
 behavior of the reference mongrel2 handler, and both the JSON and
-Tnetstrings mongrel2 protocols.
+[Tnetstrings](http://tnetstrings.org/) mongrel2 protocols.
 
 ## Dependencies
 * JDK 1.5+
 * [jzmq, the Java 0mq binding](https://github.com/zeromq/jzmq)
+* [Mongrel2, The Language Agnostic Web Server](http://mongrel2.org/home)
 * [(Optional) Jackson [jackson-core.jar, jackson-mapper.jar]](http://jackson.codehaus.org/)
+
+## Related
+
+See: The standalone [Java TNetrings implementation](https://github.com/asinger/tnetstringsj). Only the parsing part is included in this Handler. This separate project is not required as a dependency.
 
 ## Chat Example
 
