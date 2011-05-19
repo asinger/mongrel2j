@@ -10,6 +10,9 @@ Tnetstrings mongrel2 protocols.
 * [(Optional) Jackson [jackson-core.jar, jackson-mapper.jar]](http://jackson.codehaus.org/)
 
 ## Chat Example
+
+This is just showing that this handler works the same way as the reference Mongrel2 handler. The behavior is intended to be identical. You can write handlers different languages under the same mongrel2 server. This is just the chat API ported from the Mongrel2 python examples:
+
 ```java
 package org.mongrel2;
 
@@ -18,7 +21,8 @@ import java.util.concurrent.ConcurrentMap;
 import org.mongrel2.Handler;
 import org.mongrel2.Handler.Connection;
 import org.mongrel2.Handler.Request;
-import com.google.common.collect.ImmutableMap; // this is just used in example code, optional
+// guava collections are just used in example code, not required
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 
 public final class Chat {
@@ -56,6 +60,127 @@ public final class Chat {
       System.out.println("REGISTERED USERS: " + USERS.size());
     }
   }
+}
+```
+
+## Handler Scaling Recipes
+
+Handlers can be run in 1 or more processes, on one machine or across many machines. Mongrel2, via 0mq will load balance automatically. But how do you scale and parallelize work and background tasks?
+
+This library doesn't enforce any pattern. Here are some basic ones.
+
+### 1. Create a bunch of handler processes
+
+0mq, which is used under the hood, enables this Erlang style of concurrency--just pass messages between processes. The processes aren't "light weight processes", but the advantage is that multiple languages can be used in the same application.
+
+Pros:
+* Simple. No worries about thread safety because all data is copied as whole messages.
+* Similar to how you would create handlers in most other languages--run a bunch of python, lua, etc handler processes.
+* Makes a lot of sense for languages with poor threading capabilities (or lack of safer/easier high level abstractions like Executors).
+* Makes a lot of sense for any language to prevent common concurrency bugs caused by sharing mutable state.
+
+Cons:
+* The virtual machine takes requires lots of memory compared to most non-vm languages. This makes "many small processes" impossible.
+* Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
+
+If you are not doing much work in the handler (for example, just interacting with a cache), then you probly don't need to spread the work across many processes. A couple process per machine for redundancy should be good. Otherwise, you can scale by starting more processes to a limited extent.
+
+### 2. Use 0mq inproc: endpoints with ZMQ PAIR Sockets to pass messages between threads
+
+There is no need for the user of a Handler to use 0mq directly. But it 0mq is a good "safety first" tool when working with threads.
+
+See: [Multithreading with ØMQ](http://zguide.zeromq.org/page:all#toc38) in the [ØMQ Guide](http://zguide.zeromq.org/page:all)
+
+Pros:
+* No worries about thread safety because all data is copied atomically as whole messages.
+* Fewer processes to run and manage (more important for Java with that fat VM footprint)
+* Again, makes a lot of sense for safety and prevention concurrency bugs owing to mutable state clobbering or locking issues.
+
+Cons:
+* 0mq avoids problems caused by sharing data in concurrency by copying. This pro for safety is a small con for performance. (But safety first!)
+* Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
+
+### 3. Use java.util.concurrent and the high-level Executor API
+
+Requests obtained from Connections in this API are immutable and thread safe. You can simply pass them to a worker pool. It's also possible (as of 0mq 2.1.x+) to reply/deliver responses from a different pool. Just don't share mutable state! You avoid the shared data problems and also obviate the need for locking.
+
+Pros:
+* No worries about thread safety *if* only immutable data is shared.
+* Highest throughput "zero copy" option. Just pass the Request or derived immutable to executors.
+
+Cons:
+* Requires high level knowledge of the Executor framework
+* Easy to shoot self in foot if you don't know the basics
+
+But the main point is--you should be able to run handlers and spread their work however you like.
+
+Here's an example splitting work across ThreadPoolExecutor workers:
+
+```java
+package org.mongrel2;
+
+import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import org.mongrel2.Handler.Connection;
+import org.mongrel2.Handler.Request;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.io.Closeables;
+
+public class WorkerPoolThreadsExample {
+
+  private static final String SENDER_ID = "82209006-86FF-4982-B5EA-D1E29E55D481";
+  private static final Connection CONN = Handler.connection(SENDER_ID,
+    "tcp://127.0.0.1:9999", "tcp://127.0.0.1:9998");
+
+  // Or Executors.cachedThreadPool or configure a ThreadPoolExecutor instance...
+  private static final ExecutorService WORKERS = Executors.newFixedThreadPool(10);
+  private static final Random RAND = new Random();
+
+  public static void main(final String[] args) {
+
+    // How to handle clean shutdown or CTRL-C
+    Runtime.getRuntime().addShutdownHook(new Thread() {
+      @Override public void run() {
+        System.out.println("Initiating orderly shutdown of workers & waiting for task to complete");
+        // If you want all queued tasks to finish on clean shutdown or CTRL-C
+        WORKERS.shutdown();
+        System.out.println("Workers fully shut down. Bye.");
+        // or maybe you just want to WORKERS.shutdownNow(); if you don't care if
+        // queued tasks don't get done.
+        Closeables.closeQuietly(CONN);
+      }});
+
+    for (;;) { // event loop
+      final Request request = CONN.recv();
+      WORKERS.execute(new HardWorker(request)); // work done in parellel and possibly queued
+    }
+  }
+
+  private static final class HardWorker implements Runnable {
+
+    private final Request request; // Immutable Request is safely shared
+    HardWorker(Request request) {
+      this.request = request;
+    }
+
+    @Override public void run() {
+      try {
+        System.out.println("Starting Heavy Work");
+        Thread.sleep(1000); // Do all that heavy work here.
+        if (RAND.nextInt(5) == 3) { // But some exceptions may happen :)
+          throw new IllegalStateException("Oops!");
+        }
+        System.out.println("Done with Heavy Work" + request);
+        // safe to reply async from another thread.
+        CONN.replyJson(request, ImmutableMap.of("success", true));
+      } catch (final Exception e) {
+        CONN.replyJson(request, ImmutableMap.of("success", false));
+        System.err.println("Oh noes!");
+      }
+    }
+  }
+
 }
 ```
 
@@ -127,10 +252,8 @@ import org.zeromq.ZMQ.Socket;
  * handlers that run in separate processes (many processes on a single machine
  * or few processes but spread out on multiple machines). This is the common scenario
  * in most languages. You can also run a single handler that processes Requests with a
- * "worker" thread pool instead of running many "worker" processes. (More common in Java.
- * Note that sockets should never be shared across threads. This handler doesn't expose
- * them. But you can share the Request data safely in a worker pool scenario and leave
- * 0mq out if it from there.)<br><br>
+ * "worker" thread pool instead of running many "worker" processes.
+ * (More common in Java.)<br><br>
  * 
  * Or you can run background tasks triggered by the handler as separate 0mq processes,
  * or use the excellent java.util.concurrent.Executor framework...etc, etc.<br><br>

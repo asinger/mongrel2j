@@ -14,6 +14,7 @@
  */
 package org.mongrel2;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
@@ -34,6 +35,7 @@ import org.codehaus.jackson.map.type.TypeFactory;
 import org.zeromq.ZMQ;
 import org.zeromq.ZMQ.Context;
 import org.zeromq.ZMQ.Socket;
+import org.zeromq.ZMQException;
 
 /**
  * High performance Java Mongrel2 Handler that fully supports all of the behavior
@@ -64,13 +66,8 @@ import org.zeromq.ZMQ.Socket;
  * handlers that run in separate processes (many processes on a single machine
  * or few processes but spread out on multiple machines). This is the common scenario
  * in most languages. You can also run a single handler that processes Requests with a
- * "worker" thread pool instead of running many "worker" processes. (More common in Java.
- * Note that sockets should never be shared across threads. This handler doesn't expose
- * them. But you can share the Request data safely in a worker pool scenario and leave
- * 0mq out if it from there.)<br><br>
- * 
- * Or you can run background tasks triggered by the handler as separate 0mq processes,
- * or use the excellent java.util.concurrent.Executor framework...etc, etc.<br><br>
+ * "worker" thread pool instead of running many "worker" processes.
+ * (More common in Java.)<br><br>
  *
  * This handler also does not create another new way to create HTTP requests,
  * responses and headers. If you have really strict requirements to create a valid
@@ -303,7 +300,7 @@ public final class Handler {
    * raw or as JSON. It also has a way to encode HTTP responses for simplicity since
    * that'll be fairly common.
    */
-  public static final class Connection {
+  public static final class Connection implements Closeable {
 
     public static final int MAX_IDENTS = 100;
 
@@ -361,7 +358,7 @@ public final class Handler {
       send(req.sender, req.connId, getBytes(msg, charset));
     }
     /** Same as reply, but tries to convert data to JSON first. */
-    public void replyJson(Request req, Map<String, Object> jsonData) {
+    public void replyJson(Request req, Map<String, ?> jsonData) {
       send(req.sender, req.connId, Json.dump(jsonData));
     }
 
@@ -409,7 +406,7 @@ public final class Handler {
       send(uuid, join(idents, " "), getBytes(msg, charset));
     }
     /** Same as {@link Connection#deliver(String, Iterable, byte[])}, but converts to JSON first. */
-    public void deliverJson(String uuid, Iterable<String> idents, Map<String, Object> jsonData) {
+    public void deliverJson(String uuid, Iterable<String> idents, Map<String, ?> jsonData) {
       deliver(uuid, idents, Json.dump(jsonData));
     }
 
@@ -510,6 +507,20 @@ public final class Handler {
       // mongrel2 only allows ASCII headers
       return concat(asciiBytes(head), bodyBytes);
     }
+
+    /**
+     * Close underlying ZMQ.Sockets and ZMQ.Context. Doesn't actually throw
+     * IOException, but we implement Closeable with this method to use this class
+     * in libraries that take Closeables such as closeQuietly(closable) in apache
+     * commons and guava.
+     *
+     * @throws ZMQException if ZMQ has any problems disposing
+     */
+    @Override public void close() throws IOException, ZMQException {
+      reqs.close();
+      resp.close();
+      CTX.term();
+    }
   }
 
   private static String asciiFromRange(byte[] msg, int from, int to) {
@@ -590,7 +601,7 @@ public final class Handler {
     private Json() { }
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
-    static byte[] dump(Map<String, Object> jsonData) {
+    static byte[] dump(Map<String, ?> jsonData) {
       try {
         return JSON_MAPPER.writeValueAsBytes(jsonData);
       } catch (final JsonGenerationException e) {
@@ -620,7 +631,7 @@ public final class Handler {
   /**
    * A very fast tnetstring parser and dumper (serializers/deserializer). Parsing
    * produces no side affect garbage for all core tnetstring types (except for tnetstring
-   * floating poing numbers). Each data element is parsed directly from the tnetstring
+   * floating point numbers). Each data element is parsed directly from the tnetstring
    * byte array range without converstion to intermediate String or temporary object holders.<br><br>
    * 
    * Supports the full tnetstrings spec as of 2011/3/16 (blobs, dicts, lists, integers,
