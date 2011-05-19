@@ -74,12 +74,14 @@ This library doesn't enforce any pattern. Here are some basic ones.
 0mq, which is used under the hood, enables this Erlang style of concurrency--just pass messages between processes. The processes aren't "light weight processes", but the advantage is that multiple languages can be used in the same application.
 
 Pros:
+
 * Simple. No worries about thread safety because all data is copied as whole messages.
 * Similar to how you would create handlers in most other languages--run a bunch of python, lua, etc handler processes.
 * Makes a lot of sense for languages with poor threading capabilities (or lack of safer/easier high level abstractions like Executors).
 * Makes a lot of sense for any language to prevent common concurrency bugs caused by sharing mutable state.
 
 Cons:
+
 * The virtual machine takes requires lots of memory compared to most non-vm languages. This makes "many small processes" impossible.
 * Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
 
@@ -92,11 +94,13 @@ There is no need for the user of a Handler to use 0mq directly. But it 0mq is a 
 See: [Multithreading with ØMQ](http://zguide.zeromq.org/page:all#toc38) in the [ØMQ Guide](http://zguide.zeromq.org/page:all)
 
 Pros:
+
 * No worries about thread safety because all data is copied atomically as whole messages.
 * Fewer processes to run and manage (more important for Java with that fat VM footprint)
 * Again, makes a lot of sense for safety and prevention concurrency bugs owing to mutable state clobbering or locking issues.
 
 Cons:
+
 * 0mq avoids problems caused by sharing data in concurrency by copying. This pro for safety is a small con for performance. (But safety first!)
 * Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
 
@@ -105,10 +109,12 @@ Cons:
 Requests obtained from Connections in this API are immutable and thread safe. You can simply pass them to a worker pool. It's also possible (as of 0mq 2.1.x+) to reply/deliver responses from a different pool. Just don't share mutable state! You avoid the shared data problems and also obviate the need for locking.
 
 Pros:
+
 * No worries about thread safety *if* only immutable data is shared.
 * Highest throughput "zero copy" option. Just pass the Request or derived immutable to executors.
 
 Cons:
+
 * Requires high level knowledge of the Executor framework
 * Easy to shoot self in foot if you don't know the basics
 
