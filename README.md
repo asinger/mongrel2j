@@ -19,27 +19,33 @@ See: The standalone [Java TNetrings implementation](https://github.com/asinger/t
 This is just showing that this handler works the same way as the reference Mongrel2 handler. The behavior is intended to be identical. You can write handlers different languages under the same mongrel2 server. This is just the chat API ported from the Mongrel2 python examples:
 
 ```java
-package org.mongrel2;
-
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.mongrel2.Handler;
 import org.mongrel2.Handler.Connection;
 import org.mongrel2.Handler.Request;
-// guava collections are just used in example code, not required
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 
-public final class Chat {
+public final class ChatExample {
 
-  private static final String SENDER_ID = "82209006-86FF-4982-B5EA-D1E29E55D481";
-  private static final Connection CONN = Handler.connection(SENDER_ID,
-    "tcp://127.0.0.1:9999", "tcp://127.0.0.1:9998");
+  private static final Connection CONN =
+    new Handler().connection("tcp://127.0.0.1:9999", "tcp://127.0.0.1:9998");
   private static final ConcurrentMap<String, Object> USERS = Maps.newConcurrentMap();
   
   public static void main(String[] args) {
+
+    final AtomicBoolean killSignal = new AtomicBoolean(false);
+
+    // How to handle System.exit(), SIGTERM, CTRL-C...
+    Runtime.getRuntime().addShutdownHook(new Thread() {
+      @Override public void run() {
+        // set flag so we can do our closing all in one place
+        killSignal.set(true);
+      }});
     
-    for (;;) {
+    while (!killSignal.get()) { // event loop, checking kill signal
       final Request req = CONN.recv();
       
       final Map<String, Object> data = req.getData();
@@ -90,7 +96,7 @@ Cons:
 * The virtual machine takes requires lots of memory compared to most non-vm languages. This makes "many small processes" impossible.
 * Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
 
-If you are not doing much work in the handler (for example, just interacting with a cache), then you probly don't need to spread the work across many processes. A couple process per machine for redundancy should be good. Otherwise, you can scale by starting more processes to a limited extent.
+If you are not doing much work in the handler (for example, just interacting with a cache), then you probly don't need to spread the work across many processes. A couple of processes per machine for redundancy should be good. Otherwise, you can scale by starting more processes to a limited extent.
 
 ### 2. Use 0mq inproc: endpoints with ZMQ PAIR Sockets to pass messages between threads
 
@@ -106,21 +112,24 @@ Pros:
 
 Cons:
 
+* You can only pass byte[] arrays between threads. You would have to serialize to and from objects if you want to use data as objects. This adds overhead and is a bit silly when sharing between threads.
 * 0mq avoids problems caused by sharing data in concurrency by copying. This pro for safety is a small con for performance. (But safety first!)
 * Doesn't leverage stellar concurrency support in Java (java.util.Concurrent).
 
 ### 3. Use java.util.concurrent and the high-level Executor API
 
-Requests obtained from Connections in this API are immutable and thread safe. You can simply pass them to a worker pool. It's also possible (as of 0mq 2.1.x+) to reply/deliver responses from a different pool. Just don't share mutable state! You avoid the shared data problems and also obviate the need for locking.
+Requests obtained from Connections in this API are immutable and thread safe. You can simply pass them to a worker pool, [Akka Actors](http://akka.io/), etc. It's also possible (as of 0mq 2.1.x+) to reply/deliver responses from a different pool. Just don't share mutable state! You avoid the shared data problems and also obviate the need for locking.
+
+Note that it *is* safe to share Connections and any objects in this API between threads. The underlying 0mq API doesn't allow sockets to be migrated across threads without fences/memory barriers in place. This implementation handles the 0mq rules internally. Connections are stored in thread local storage so there is no contention.
 
 Pros:
 
 * No worries about thread safety *if* only immutable data is shared.
-* Highest throughput "zero copy" option. Just pass the Request or derived immutable to executors.
+* Highest throughput "zero copy" option. Just pass the Request or derived immutable objects to executors.
 
 Cons:
 
-* Requires high level knowledge of the Executor framework
+* Requires high level knowledge of the Executor framework (or Actor frameworks)
 * Easy to shoot self in foot if you don't know the basics
 
 But the main point is--you should be able to run handlers and spread their work however you like.
@@ -128,21 +137,21 @@ But the main point is--you should be able to run handlers and spread their work 
 ####Example splitting work across ThreadPoolExecutor workers:
 
 ```java
-package org.mongrel2;
-
 import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import org.mongrel2.Handler;
 import org.mongrel2.Handler.Connection;
 import org.mongrel2.Handler.Request;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.io.Closeables;
 
-public class WorkerPoolThreadsExample {
+public class ExecutorExample {
 
   private static final String SENDER_ID = "82209006-86FF-4982-B5EA-D1E29E55D481";
-  private static final Connection CONN = Handler.connection(SENDER_ID,
-    "tcp://127.0.0.1:9999", "tcp://127.0.0.1:9998");
+  private static final String PUB_ADDRESS = "tcp://127.0.0.1:9998";
+  private static final String SUB_ADDRESS = "tcp://127.0.0.1:9999";
 
   // Or Executors.cachedThreadPool or configure a ThreadPoolExecutor instance...
   private static final ExecutorService WORKERS = Executors.newFixedThreadPool(10);
@@ -150,44 +159,54 @@ public class WorkerPoolThreadsExample {
 
   public static void main(final String[] args) {
 
-    // How to handle clean shutdown or CTRL-C
+    final AtomicBoolean killSignal = new AtomicBoolean(false);
+
+    // How to handle System.exit(), SIGTERM, CTRL-C...
     Runtime.getRuntime().addShutdownHook(new Thread() {
       @Override public void run() {
-        System.out.println("Initiating orderly shutdown of workers & waiting for task to complete");
-        // If you want all queued tasks to finish on clean shutdown or CTRL-C
-        WORKERS.shutdown();
-        System.out.println("Workers fully shut down. Bye.");
-        // or maybe you just want to WORKERS.shutdownNow(); if you don't care if
-        // queued tasks don't get done.
-        Closeables.closeQuietly(CONN);
+        // set flag so we can do our closing all in one place
+        killSignal.set(true);
       }});
 
-    for (;;) { // event loop
-      final Request request = CONN.recv();
-      WORKERS.execute(new HardWorker(request)); // work done in parellel and possibly queued
+    Handler handler = null;
+    try {
+      handler = new Handler();
+      final Connection connection = handler.connection(SUB_ADDRESS, PUB_ADDRESS);
+      while (!killSignal.get()) { // event loop, checking kill signal
+        final Request request = connection.recv();
+        WORKERS.execute(new HardWorker(connection, request)); // work done in parallel and queued
+      }
+    } finally {
+      System.out.println("Initiating shutdown of workers & waiting for task to complete");
+      // If you want all queued tasks to finish; else do shutdownNow()
+      WORKERS.shutdown();
+      Closeables.closeQuietly(handler);
     }
   }
 
   private static final class HardWorker implements Runnable {
 
+    private final Connection connection; // safe to share Connection across threads
     private final Request request; // Immutable Request is safely shared
-    HardWorker(Request request) {
+
+    HardWorker(Connection connection, Request request) {
+      this.connection = connection;
       this.request = request;
     }
 
     @Override public void run() {
-      try {
+      try {      
         System.out.println("Starting Heavy Work");
         Thread.sleep(1000); // Do all that heavy work here.
         if (RAND.nextInt(5) == 3) { // But some exceptions may happen :)
           throw new IllegalStateException("Oops!");
         }
         System.out.println("Done with Heavy Work" + request);
-        // safe to reply async from another thread.
-        CONN.replyJson(request, ImmutableMap.of("success", true));
+        connection.replyJson(request, ImmutableMap.of("success", true));
       } catch (final Exception e) {
-        CONN.replyJson(request, ImmutableMap.of("success", false));
-        System.err.println("Oh noes!");
+        // Just an example...
+        connection.replyJson(request, ImmutableMap.of("success", false));
+        // log exception
       }
     }
   }
@@ -213,6 +232,7 @@ public class WorkerPoolThreadsExample {
  */
 package org.mongrel2;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.Serializable;
 import java.io.UnsupportedEncodingException;
@@ -220,11 +240,14 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import org.codehaus.jackson.JsonGenerationException;
 import org.codehaus.jackson.JsonParseException;
 import org.codehaus.jackson.map.JsonMappingException;
@@ -233,6 +256,7 @@ import org.codehaus.jackson.map.type.TypeFactory;
 import org.zeromq.ZMQ;
 import org.zeromq.ZMQ.Context;
 import org.zeromq.ZMQ.Socket;
+import org.zeromq.ZMQException;
 
 /**
  * High performance Java Mongrel2 Handler that fully supports all of the behavior
@@ -265,13 +289,10 @@ import org.zeromq.ZMQ.Socket;
  * in most languages. You can also run a single handler that processes Requests with a
  * "worker" thread pool instead of running many "worker" processes.
  * (More common in Java.)<br><br>
- * 
- * Or you can run background tasks triggered by the handler as separate 0mq processes,
- * or use the excellent java.util.concurrent.Executor framework...etc, etc.<br><br>
  *
  * This handler also does not create another new way to create HTTP requests,
  * responses and headers. If you have really strict requirements to create a valid
- * response for example, you can use Apache HTTPComponents Core, which provides a
+ * response, for example, you can use Apache HTTPComponents Core, which provides a
  * very rich object model and set of builders (HTTPResponse objects, Header objects,
  * StatusLine, HeaderElement, HeaderGroup, HeaderIterator, HTTPEntity, plenty of
  * Constants for valid reason codes--dozens (hundreds?) of classes to model HTTP.).<br><br>
@@ -281,31 +302,94 @@ import org.zeromq.ZMQ.Socket;
  * is worth it.<br><br>
  * 
  * Updated on 2011/03/01 to support tnetstrings<br>
- * Updated on 2011/03/16 to support tnetstring floats
+ * Updated on 2011/03/16 to support tnetstring floats<br>
+ * Updated on 2011/03/31 to handle more threading scenarios<br>
  * 
  * @author Armando Singer (armando.singer at gmail dot com)
  * 
- * @version 1.6.1
+ * @version 1.6.2
  *
  * @see <a href="https://github.com/zeromq/jzmq">(Required) jzmq - Java binding for 0MQ</a>
  * @see <a href="http://jackson.codehaus.org/">(Required only if json used) Jackson - High-performance JSON processor</a>
  * @see <a href="http://code.google.com/p/guava-libraries/">(Totally Optional) Guava libraries</a>
  * @see <a href="http://hc.apache.org/httpcomponents-core-ga/index.html">(Totally Optional) Apache HttpCore</a>
  */
-public final class Handler {
+public final class Handler implements Closeable {
 
-  private Handler() { }
+  private final Context context;
+  
+  /**
+   * Sockets should never be shared across threads, or errors result. But clients
+   * of this higher level class shouldn't have to know the rules of 0mq sockets.
+   * It should be possible to recv and reply from Executor pools, actors, etc.
+   * Each Connection is put in thread local storage so client code doesn't make
+   * sure that threads and 0mq sockets are 1 to 1 or putting in appropriate
+   * fences/membars.
+   */
+  private static final ThreadLocal<Map<String, Connection>> connection =
+    new ThreadLocal<Map<String, Connection>>() {
+    @Override protected Map<String, Connection> initialValue() {
+      return new HashMap<String, Connection>(2);
+    }
+  };
+
+  private final Queue<Connection> connectionsToClose = new ConcurrentLinkedQueue<Connection>();
+  
+  public Handler() {
+    // Generally context per jvm; see: http://zguide.zeromq.org/chapter:all#toc12
+    // But it's possible to create multiple Handlers...
+    this.context = ZMQ.context(1);
+  }
 
   // charset for mongrel2 http headers, the connection senderId, uuid, connid
   // & the request senderId, connId, path and some built-in header names
   private static final Charset ASCII = Charset.forName("US-ASCII");
 
-  public static Connection connection(String senderId, String subAddress, String pubAddress) {
-    return new Connection(senderId, subAddress, pubAddress);
+  /**
+   * @return a Connection that recv's on the specified subAddress and
+   *   replies/delivers to the specified pubAddress
+   */
+  public Connection connection(String subAddress, String pubAddress) {
+    final String key = subAddress + pubAddress;
+    final Map<String, Connection> connMap = connection.get();
+    final Connection conn = connMap.get(key);
+    if (conn != null) {
+      return conn;
+    }
+    final Connection newConn = pubAddress == null ? new Connection(subAddress, context)
+      : new Connection(subAddress, pubAddress, context);
+    connMap.put(key, newConn);
+    connectionsToClose.add(newConn);
+    return newConn;
   }
 
-  public static Connection connection(byte[] senderId, String subAddress, String pubAddress) {
-    return new Connection(senderId, subAddress, pubAddress);
+  /** @return a Connection that's just for receiving (recv) */
+  public Connection connection(String subAddress) {
+    return connection(subAddress, null);
+  }
+
+  /**
+   * Close underlying ZMQ.Sockets and ZMQ.Context. Doesn't actually throw IOException,
+   * but we implement Closeable with this method to use this class as an AutoCloseable
+   * in Java 7 with Automatic Resouce Management, and in libraries that
+   * take Closeables such as closeQuietly(closable) in apache
+   * commons and guava.
+   *
+   * @throws ZMQException if ZMQ has any problems disposing
+   */
+  @Override public void close() throws IOException {
+    try {
+      for (final Connection connection : connectionsToClose) {
+        try {
+          connection.close();
+        } catch (final ZMQException ignore) {
+          // It's possible to get an exception here, but we're closing anyway
+          // and we want to continue
+        }
+      }
+    } finally {
+      context.term();
+    }
   }
 
   /** The mogrel2 request; instances are deeply immutable and thread safe */
@@ -392,7 +476,7 @@ public final class Handler {
     public List<String> getHeaderValues(String name) {
       final List<String> result = getHeaders().get(name);
       if (result != null) return result;
-      
+
       // must support case insensitivity of headers per rfc 2616
       for (final Entry<String, List<String>> header : getHeaders().entrySet()) {
         if (header.getKey().equalsIgnoreCase(name)) return header.getValue();
@@ -474,8 +558,8 @@ public final class Handler {
       return Arrays.equals(msg, that.msg);
     }
 
-    // ensure header values are always a List, which may be a singletonList, or the empty list.
-    // All List types are unmodifiable, and so is the resulting Map.
+    /** ensure header values are always a List, which may be a singletonList, or the empty list.
+     * All List types are unmodifiable, and so is the resulting Map. */
     @SuppressWarnings("unchecked")
     private static Map<String, List<String>> normalizeHeaders(Map<String, Object> headers) {
       final Map<String, List<String>> result = new LinkedHashMap<String, List<String>>(headers.size());
@@ -494,46 +578,43 @@ public final class Handler {
   }
 
   /**
-   * A Connection object manages the connection between your handler and a Mongrel2 server
-   * (or servers). It can receive raw requests or JSON encoded requests whether from HTTP
-   * or MSG request types, and it can send individual responses or batch responses either
-   * raw or as JSON. It also has a way to encode HTTP responses for simplicity since
+   * Manages the connection between your handler and the Mongrel2 server (or servers).
+   * It can receive raw requests or JSON encoded requests whether from HTTP or MSG
+   * request types, and can send individual responses or batch responses either raw
+   * or as JSON. It also has a way to encode HTTP responses for simplicity since
    * that'll be fairly common.
    */
   public static final class Connection {
 
     public static final int MAX_IDENTS = 100;
 
-    /** One context per jvm; see: http://zguide.zeromq.org/chapter:all#toc10 */
-    private static final Context CTX = ZMQ.context(1);
-
-    private final byte[] senderId;
     private final String subAddress, pubAddress;
     private final Socket reqs, resp;
 
-    /** @throws IllegalArgumentException if any param is null or empty */
-    public Connection(String senderId, String subAddress, String pubAddress) {
-      this(asciiBytes(senderId), subAddress, pubAddress);
+    /** Create a conection that only receives.
+     * @throws IllegalArgumentException if any param is null or empty */
+    private Connection(final String subAddress, final Context ctx) {
+      this.subAddress = checkNotNullOrEmpty(subAddress, "must specify a subAddress");
+      this.reqs = ctx.socket(ZMQ.PULL);
+      this.reqs.connect(subAddress);
+      this.pubAddress = null;
+      this.resp = null;
     }
 
     /**
      * Addresses are 0mq format, for example: tcp://127.0.0.1:9998
      * @throws IllegalArgumentException if any param is null or empty
      */
-    private Connection(byte [] senderId, String subAddress, String pubAddress) {
-      this.senderId = checkNotNullOrEmpty(senderId, "must specify a senderId");
+    private Connection(String subAddress, String pubAddress, Context ctx) {
       this.subAddress = checkNotNullOrEmpty(subAddress, "must specify a subAddress");
       this.pubAddress = checkNotNullOrEmpty(pubAddress, "must specify a pubAddress");
-      this.reqs = CTX.socket(ZMQ.PULL);
-      reqs.connect(subAddress);
-      this.resp = CTX.socket(ZMQ.PUB);
-      resp.setIdentity(senderId);
-      resp.connect(pubAddress);
+      this.reqs = ctx.socket(ZMQ.PULL);
+      this.reqs.connect(subAddress);
+      this.resp = ctx.socket(ZMQ.PUB);
+      this.resp.connect(pubAddress);
     }
 
-    /**
-     * @return created mongrel2 Request from 0mq.
-     */
+    /** @return new immutable mongrel2 Request */
     public Request recv() { return Request.parse(reqs.recv(0), false); }
 
     /**
@@ -541,9 +622,11 @@ public final class Handler {
      * does this if the METHOD  header is 'JSON' but you can use this to force it
      * for say HTTP requests.
      * @see {@link Request#getData()}
-     * @return created mongrel2 Request from 0mq.
+     * @return new immutable mongrel2 Request from 0mq.
      */
     public Request recvJson() { return Request.parse(reqs.recv(0), true); }
+
+    public String getSubAddress() { return subAddress; }
 
     /** Raw send to the given connection ID at the given uuid. */ 
     void send(String uuid, String connId, byte[] msg) {
@@ -558,7 +641,7 @@ public final class Handler {
       send(req.sender, req.connId, getBytes(msg, charset));
     }
     /** Same as reply, but tries to convert data to JSON first. */
-    public void replyJson(Request req, Map<String, Object> jsonData) {
+    public void replyJson(Request req, Map<String, ?> jsonData) {
       send(req.sender, req.connId, Json.dump(jsonData));
     }
 
@@ -606,7 +689,7 @@ public final class Handler {
       send(uuid, join(idents, " "), getBytes(msg, charset));
     }
     /** Same as {@link Connection#deliver(String, Iterable, byte[])}, but converts to JSON first. */
-    public void deliverJson(String uuid, Iterable<String> idents, Map<String, Object> jsonData) {
+    public void deliverJson(String uuid, Iterable<String> idents, Map<String, ?> jsonData) {
       deliver(uuid, idents, Json.dump(jsonData));
     }
 
@@ -656,28 +739,20 @@ public final class Handler {
     public void deliverClose(String uuid, Iterable<String> idents) {
       deliver(uuid, idents, EMPTY_BYTE_ARRAY);
     }
-    
-    public byte[] getSenderId() {
-      final byte[] copy = new byte[senderId.length];
-      System.arraycopy(senderId, 0, copy, 0, senderId.length);
-      return copy;
-    }
-    public String getSenderIdString() { return asciiFromRange(senderId, 0, senderId.length); }
-    public String getSubAddress() { return subAddress; }
+
     public String getPubAddress() { return pubAddress; }
 
     @Override public String toString() {
-      return "Connection [senderId=" + Arrays.toString(senderId) + ", subAddress="
-        + subAddress + ", pubAddress=" + pubAddress + "]";
+      return "Connection [subAddress=" + subAddress + ", pubAddress=" + pubAddress + "]";
     }
+
     @Override public int hashCode() {
-      return hash(senderId, pubAddress, subAddress);
+      return hash(subAddress, pubAddress);
     }
     @Override public boolean equals(Object o) {
       if (!(o instanceof Connection)) return false;
       final Connection that = (Connection) o;
-      return Arrays.equals(senderId, that.senderId) && eq(pubAddress, that.pubAddress)
-        && eq(subAddress, that.subAddress);
+      return eq(subAddress, that.subAddress) && eq(pubAddress, that.pubAddress);
     }
 
     private static byte[] EMPTY_BYTE_ARRAY = new byte[0];
@@ -707,6 +782,15 @@ public final class Handler {
       // mongrel2 only allows ASCII headers
       return concat(asciiBytes(head), bodyBytes);
     }
+
+    private void close() {
+      try {
+        reqs.close();
+      } finally {
+        resp.close();
+      }
+    }
+
   }
 
   private static String asciiFromRange(byte[] msg, int from, int to) {
@@ -787,7 +871,7 @@ public final class Handler {
     private Json() { }
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
-    static byte[] dump(Map<String, Object> jsonData) {
+    static byte[] dump(Map<String, ?> jsonData) {
       try {
         return JSON_MAPPER.writeValueAsBytes(jsonData);
       } catch (final JsonGenerationException e) {
@@ -817,7 +901,7 @@ public final class Handler {
   /**
    * A very fast tnetstring parser and dumper (serializers/deserializer). Parsing
    * produces no side affect garbage for all core tnetstring types (except for tnetstring
-   * floating poing numbers). Each data element is parsed directly from the tnetstring
+   * floating point numbers). Each data element is parsed directly from the tnetstring
    * byte array range without converstion to intermediate String or temporary object holders.<br><br>
    * 
    * Supports the full tnetstrings spec as of 2011/3/16 (blobs, dicts, lists, integers,

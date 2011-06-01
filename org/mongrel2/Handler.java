@@ -22,11 +22,14 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import org.codehaus.jackson.JsonGenerationException;
 import org.codehaus.jackson.JsonParseException;
 import org.codehaus.jackson.map.JsonMappingException;
@@ -71,7 +74,7 @@ import org.zeromq.ZMQException;
  *
  * This handler also does not create another new way to create HTTP requests,
  * responses and headers. If you have really strict requirements to create a valid
- * response for example, you can use Apache HTTPComponents Core, which provides a
+ * response, for example, you can use Apache HTTPComponents Core, which provides a
  * very rich object model and set of builders (HTTPResponse objects, Header objects,
  * StatusLine, HeaderElement, HeaderGroup, HeaderIterator, HTTPEntity, plenty of
  * Constants for valid reason codes--dozens (hundreds?) of classes to model HTTP.).<br><br>
@@ -81,31 +84,94 @@ import org.zeromq.ZMQException;
  * is worth it.<br><br>
  * 
  * Updated on 2011/03/01 to support tnetstrings<br>
- * Updated on 2011/03/16 to support tnetstring floats
+ * Updated on 2011/03/16 to support tnetstring floats<br>
+ * Updated on 2011/03/31 to handle more threading scenarios<br>
  * 
  * @author Armando Singer (armando.singer at gmail dot com)
  * 
- * @version 1.6.1
+ * @version 1.6.2
  *
  * @see <a href="https://github.com/zeromq/jzmq">(Required) jzmq - Java binding for 0MQ</a>
  * @see <a href="http://jackson.codehaus.org/">(Required only if json used) Jackson - High-performance JSON processor</a>
  * @see <a href="http://code.google.com/p/guava-libraries/">(Totally Optional) Guava libraries</a>
  * @see <a href="http://hc.apache.org/httpcomponents-core-ga/index.html">(Totally Optional) Apache HttpCore</a>
  */
-public final class Handler {
+public final class Handler implements Closeable {
 
-  private Handler() { }
+  private final Context context;
+  
+  /**
+   * Sockets should never be shared across threads, or errors result. But clients
+   * of this higher level class shouldn't have to know the rules of 0mq sockets.
+   * It should be possible to recv and reply from Executor pools, actors, etc.
+   * Each Connection is put in thread local storage so client code doesn't make
+   * sure that threads and 0mq sockets are 1 to 1 or putting in appropriate
+   * fences/membars.
+   */
+  private static final ThreadLocal<Map<String, Connection>> connection =
+    new ThreadLocal<Map<String, Connection>>() {
+    @Override protected Map<String, Connection> initialValue() {
+      return new HashMap<String, Connection>(2);
+    }
+  };
+
+  private final Queue<Connection> connectionsToClose = new ConcurrentLinkedQueue<Connection>();
+  
+  public Handler() {
+    // Generally context per jvm; see: http://zguide.zeromq.org/chapter:all#toc12
+    // But it's possible to create multiple Handlers...
+    this.context = ZMQ.context(1);
+  }
 
   // charset for mongrel2 http headers, the connection senderId, uuid, connid
   // & the request senderId, connId, path and some built-in header names
   private static final Charset ASCII = Charset.forName("US-ASCII");
 
-  public static Connection connection(String senderId, String subAddress, String pubAddress) {
-    return new Connection(senderId, subAddress, pubAddress);
+  /**
+   * @return a Connection that recv's on the specified subAddress and
+   *   replies/delivers to the specified pubAddress
+   */
+  public Connection connection(String subAddress, String pubAddress) {
+    final String key = subAddress + pubAddress;
+    final Map<String, Connection> connMap = connection.get();
+    final Connection conn = connMap.get(key);
+    if (conn != null) {
+      return conn;
+    }
+    final Connection newConn = pubAddress == null ? new Connection(subAddress, context)
+      : new Connection(subAddress, pubAddress, context);
+    connMap.put(key, newConn);
+    connectionsToClose.add(newConn);
+    return newConn;
   }
 
-  public static Connection connection(byte[] senderId, String subAddress, String pubAddress) {
-    return new Connection(senderId, subAddress, pubAddress);
+  /** @return a Connection that's just for receiving (recv) */
+  public Connection connection(String subAddress) {
+    return connection(subAddress, null);
+  }
+
+  /**
+   * Close underlying ZMQ.Sockets and ZMQ.Context. Doesn't actually throw IOException,
+   * but we implement Closeable with this method to use this class as an AutoCloseable
+   * in Java 7 with Automatic Resouce Management, and in libraries that
+   * take Closeables such as closeQuietly(closable) in apache
+   * commons and guava.
+   *
+   * @throws ZMQException if ZMQ has any problems disposing
+   */
+  @Override public void close() throws IOException {
+    try {
+      for (final Connection connection : connectionsToClose) {
+        try {
+          connection.close();
+        } catch (final ZMQException ignore) {
+          // It's possible to get an exception here, but we're closing anyway
+          // and we want to continue
+        }
+      }
+    } finally {
+      context.term();
+    }
   }
 
   /** The mogrel2 request; instances are deeply immutable and thread safe */
@@ -192,7 +258,7 @@ public final class Handler {
     public List<String> getHeaderValues(String name) {
       final List<String> result = getHeaders().get(name);
       if (result != null) return result;
-      
+
       // must support case insensitivity of headers per rfc 2616
       for (final Entry<String, List<String>> header : getHeaders().entrySet()) {
         if (header.getKey().equalsIgnoreCase(name)) return header.getValue();
@@ -274,8 +340,8 @@ public final class Handler {
       return Arrays.equals(msg, that.msg);
     }
 
-    // ensure header values are always a List, which may be a singletonList, or the empty list.
-    // All List types are unmodifiable, and so is the resulting Map.
+    /** ensure header values are always a List, which may be a singletonList, or the empty list.
+     * All List types are unmodifiable, and so is the resulting Map. */
     @SuppressWarnings("unchecked")
     private static Map<String, List<String>> normalizeHeaders(Map<String, Object> headers) {
       final Map<String, List<String>> result = new LinkedHashMap<String, List<String>>(headers.size());
@@ -294,46 +360,43 @@ public final class Handler {
   }
 
   /**
-   * A Connection object manages the connection between your handler and a Mongrel2 server
-   * (or servers). It can receive raw requests or JSON encoded requests whether from HTTP
-   * or MSG request types, and it can send individual responses or batch responses either
-   * raw or as JSON. It also has a way to encode HTTP responses for simplicity since
+   * Manages the connection between your handler and the Mongrel2 server (or servers).
+   * It can receive raw requests or JSON encoded requests whether from HTTP or MSG
+   * request types, and can send individual responses or batch responses either raw
+   * or as JSON. It also has a way to encode HTTP responses for simplicity since
    * that'll be fairly common.
    */
-  public static final class Connection implements Closeable {
+  public static final class Connection {
 
     public static final int MAX_IDENTS = 100;
 
-    /** One context per jvm; see: http://zguide.zeromq.org/chapter:all#toc10 */
-    private static final Context CTX = ZMQ.context(1);
-
-    private final byte[] senderId;
     private final String subAddress, pubAddress;
     private final Socket reqs, resp;
 
-    /** @throws IllegalArgumentException if any param is null or empty */
-    public Connection(String senderId, String subAddress, String pubAddress) {
-      this(asciiBytes(senderId), subAddress, pubAddress);
+    /** Create a conection that only receives.
+     * @throws IllegalArgumentException if any param is null or empty */
+    private Connection(final String subAddress, final Context ctx) {
+      this.subAddress = checkNotNullOrEmpty(subAddress, "must specify a subAddress");
+      this.reqs = ctx.socket(ZMQ.PULL);
+      this.reqs.connect(subAddress);
+      this.pubAddress = null;
+      this.resp = null;
     }
 
     /**
      * Addresses are 0mq format, for example: tcp://127.0.0.1:9998
      * @throws IllegalArgumentException if any param is null or empty
      */
-    private Connection(byte [] senderId, String subAddress, String pubAddress) {
-      this.senderId = checkNotNullOrEmpty(senderId, "must specify a senderId");
+    private Connection(String subAddress, String pubAddress, Context ctx) {
       this.subAddress = checkNotNullOrEmpty(subAddress, "must specify a subAddress");
       this.pubAddress = checkNotNullOrEmpty(pubAddress, "must specify a pubAddress");
-      this.reqs = CTX.socket(ZMQ.PULL);
-      reqs.connect(subAddress);
-      this.resp = CTX.socket(ZMQ.PUB);
-      resp.setIdentity(senderId);
-      resp.connect(pubAddress);
+      this.reqs = ctx.socket(ZMQ.PULL);
+      this.reqs.connect(subAddress);
+      this.resp = ctx.socket(ZMQ.PUB);
+      this.resp.connect(pubAddress);
     }
 
-    /**
-     * @return created mongrel2 Request from 0mq.
-     */
+    /** @return new immutable mongrel2 Request */
     public Request recv() { return Request.parse(reqs.recv(0), false); }
 
     /**
@@ -341,9 +404,11 @@ public final class Handler {
      * does this if the METHOD  header is 'JSON' but you can use this to force it
      * for say HTTP requests.
      * @see {@link Request#getData()}
-     * @return created mongrel2 Request from 0mq.
+     * @return new immutable mongrel2 Request from 0mq.
      */
     public Request recvJson() { return Request.parse(reqs.recv(0), true); }
+
+    public String getSubAddress() { return subAddress; }
 
     /** Raw send to the given connection ID at the given uuid. */ 
     void send(String uuid, String connId, byte[] msg) {
@@ -456,28 +521,20 @@ public final class Handler {
     public void deliverClose(String uuid, Iterable<String> idents) {
       deliver(uuid, idents, EMPTY_BYTE_ARRAY);
     }
-    
-    public byte[] getSenderId() {
-      final byte[] copy = new byte[senderId.length];
-      System.arraycopy(senderId, 0, copy, 0, senderId.length);
-      return copy;
-    }
-    public String getSenderIdString() { return asciiFromRange(senderId, 0, senderId.length); }
-    public String getSubAddress() { return subAddress; }
+
     public String getPubAddress() { return pubAddress; }
 
     @Override public String toString() {
-      return "Connection [senderId=" + Arrays.toString(senderId) + ", subAddress="
-        + subAddress + ", pubAddress=" + pubAddress + "]";
+      return "Connection [subAddress=" + subAddress + ", pubAddress=" + pubAddress + "]";
     }
+
     @Override public int hashCode() {
-      return hash(senderId, pubAddress, subAddress);
+      return hash(subAddress, pubAddress);
     }
     @Override public boolean equals(Object o) {
       if (!(o instanceof Connection)) return false;
       final Connection that = (Connection) o;
-      return Arrays.equals(senderId, that.senderId) && eq(pubAddress, that.pubAddress)
-        && eq(subAddress, that.subAddress);
+      return eq(subAddress, that.subAddress) && eq(pubAddress, that.pubAddress);
     }
 
     private static byte[] EMPTY_BYTE_ARRAY = new byte[0];
@@ -508,19 +565,14 @@ public final class Handler {
       return concat(asciiBytes(head), bodyBytes);
     }
 
-    /**
-     * Close underlying ZMQ.Sockets and ZMQ.Context. Doesn't actually throw
-     * IOException, but we implement Closeable with this method to use this class
-     * in libraries that take Closeables such as closeQuietly(closable) in apache
-     * commons and guava.
-     *
-     * @throws ZMQException if ZMQ has any problems disposing
-     */
-    @Override public void close() throws IOException {
-      reqs.close();
-      resp.close();
-      CTX.term();
+    private void close() {
+      try {
+        reqs.close();
+      } finally {
+        resp.close();
+      }
     }
+
   }
 
   private static String asciiFromRange(byte[] msg, int from, int to) {
